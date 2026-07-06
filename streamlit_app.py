@@ -1,5 +1,6 @@
 from datetime import date
 
+import groq
 import pandas as pd
 
 import streamlit as st
@@ -94,6 +95,62 @@ def parse_weight_backup_csv(uploaded_file):
     backup_df["date"] = pd.to_datetime(backup_df["date"], format="%Y-%m-%d").dt.date
     backup_df["weight_kg"] = pd.to_numeric(backup_df["weight_kg"])
     return backup_df.sort_values("date").reset_index(drop=True)
+
+
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+WORKOUT_GOALS = ["בניית שריר וחיזוק", "ירידה במשקל", "שיפור כושר וסיבולת"]
+WORKOUT_LEVELS = ["מתחיל", "בינוני", "מתקדם"]
+WORKOUT_EQUIPMENT = ["ללא ציוד (משקל גוף)", "משקולות בסיסיות בבית", "חדר כושר מלא"]
+
+WORKOUT_SYSTEM_PROMPT = """\
+את/ה מאמן/ת כושר מוסמך/ת ומנוסה, וכותב/ת בעברית טבעית וברורה.
+בנה/י תוכנית אימונים שבועית שמתאימה בדיוק למטרה, לרמת המתאמן/ת, למספר ימי \
+האימון בשבוע, למשך האימון ולציוד הזמין שצוינו על ידי המשתמש/ת.
+
+מבנה התשובה:
+1. שורת פתיחה קצרה אחת שמתארת את התוכנית.
+2. לכל יום אימון: כותרת מודגשת (לדוגמה **יום 1 — פלג גוף עליון**), שורת חימום \
+קצרה, ולאחריה רשימת תרגילים בפורמט: "שם התרגיל — 3x12, מנוחה 60 שניות" \
+(אפשר להוסיף את שם התרגיל באנגלית בסוגריים כשזה עוזר).
+3. ציון ברור אילו ימים הם ימי מנוחה.
+4. בסיום, בדיוק 3 כללי בטיחות קצרים: טכניקה לפני משקל, עצירה מיידית אם יש \
+כאב, והתקדמות הדרגתית.
+5. שורת סיום אחת שאומרת שהתוכנית כללית, מיועדת למבוגרים בריאים, ושיש \
+להתייעץ עם רופא/ה במקרה של ספק.
+
+לעולם אל תיתן/י ייעוץ רפואי, טיפול בפציעות או המלצות על תוספי תזונה.
+"""
+
+
+def build_workout_user_prompt(goal, level, days_per_week, duration_minutes, equipment):
+    return (
+        f"מטרה: {goal}\n"
+        f"רמה: {level}\n"
+        f"ימי אימון בשבוע: {days_per_week}\n"
+        f"משך כל אימון: {duration_minutes} דקות\n"
+        f"ציוד זמין: {equipment}\n"
+        "בנה/י עבורי תוכנית אימונים שבועית מותאמת."
+    )
+
+
+def generate_workout_plan(api_key, goal, level, days_per_week, duration_minutes, equipment):
+    client = groq.Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": WORKOUT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_workout_user_prompt(
+                    goal, level, days_per_week, duration_minutes, equipment
+                ),
+            },
+        ],
+        temperature=0.4,
+        max_tokens=2500,
+    )
+    return response.choices[0].message.content
 
 
 st.set_page_config(
@@ -582,7 +639,71 @@ with tab_weight:
     )
 
 with tab_workout:
-    st.markdown(placeholder_html, unsafe_allow_html=True)
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY")
+    except st.errors.StreamlitSecretNotFoundError:
+        api_key = None
+
+    if not api_key:
+        st.markdown(
+            """
+            <div class="gemifit-warning">
+                ⚠️ חסר מפתח AI. יש להגדיר GROQ_API_KEY בהגדרות הסודות של האתר.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        with st.form("workout_plan_form"):
+            goal = st.radio("מטרה", WORKOUT_GOALS)
+            level = st.radio("רמה", WORKOUT_LEVELS, horizontal=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                days_per_week = st.number_input(
+                    "ימי אימון בשבוע", min_value=2, max_value=6, value=3, step=1
+                )
+            with col2:
+                duration_minutes = st.radio(
+                    "משך אימון", [30, 45, 60], horizontal=True, format_func=lambda m: f"{m} דקות"
+                )
+
+            equipment = st.radio("ציוד זמין", WORKOUT_EQUIPMENT)
+
+            workout_submitted = st.form_submit_button("צור לי תוכנית אימון")
+
+        if workout_submitted:
+            with st.spinner("בונה לך תוכנית מותאמת..."):
+                try:
+                    plan_text = generate_workout_plan(
+                        api_key, goal, level, days_per_week, duration_minutes, equipment
+                    )
+                    st.session_state["workout_plan"] = plan_text
+                    st.session_state.pop("workout_error", None)
+                except groq.RateLimitError:
+                    st.session_state["workout_error"] = (
+                        "המכסה היומית של ה-AI הסתיימה — נסו שוב מאוחר יותר."
+                    )
+                    st.session_state.pop("workout_plan", None)
+                except groq.APIError:
+                    st.session_state["workout_error"] = (
+                        "אירעה שגיאה בתקשורת עם שירות ה-AI. נסו שוב בעוד כמה רגעים."
+                    )
+                    st.session_state.pop("workout_plan", None)
+
+        workout_error = st.session_state.get("workout_error")
+        if workout_error:
+            st.error(workout_error)
+
+        workout_plan = st.session_state.get("workout_plan")
+        if workout_plan:
+            st.markdown(workout_plan)
+            st.download_button(
+                "הורד את התוכנית",
+                data=workout_plan.encode("utf-8"),
+                file_name="gemifit_workout_plan.txt",
+                mime="text/plain",
+            )
 
 with tab_nutrition:
     st.markdown(placeholder_html, unsafe_allow_html=True)
