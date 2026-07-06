@@ -1,3 +1,7 @@
+from datetime import date
+
+import pandas as pd
+
 import streamlit as st
 
 ACTIVITY_FACTORS = {
@@ -58,6 +62,38 @@ def calculate_calorie_plan(sex, age, weight, height, activity_label, goal):
         "clamped": clamped,
         "floor": floor,
     }
+
+
+WEIGHT_BACKUP_COLUMNS = ["date", "weight_kg"]
+
+
+def get_weight_entries():
+    if "weight_entries" not in st.session_state:
+        st.session_state["weight_entries"] = pd.DataFrame(columns=WEIGHT_BACKUP_COLUMNS)
+    return st.session_state["weight_entries"]
+
+
+def upsert_weight_entry(df, entry_date, weight_kg):
+    df = df[df["date"] != entry_date]
+    new_row = pd.DataFrame([{"date": entry_date, "weight_kg": weight_kg}])
+    df = pd.concat([df, new_row], ignore_index=True)
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def delete_weight_entry(df, entry_date):
+    return df[df["date"] != entry_date].reset_index(drop=True)
+
+
+def parse_weight_backup_csv(uploaded_file):
+    backup_df = pd.read_csv(uploaded_file)
+    if list(backup_df.columns) != WEIGHT_BACKUP_COLUMNS:
+        raise ValueError("עמודות הקובץ אינן תואמות לפורמט הגיבוי")
+    if backup_df.empty:
+        return backup_df.astype({"date": "object", "weight_kg": "float"})
+
+    backup_df["date"] = pd.to_datetime(backup_df["date"], format="%Y-%m-%d").dt.date
+    backup_df["weight_kg"] = pd.to_numeric(backup_df["weight_kg"])
+    return backup_df.sort_values("date").reset_index(drop=True)
 
 
 st.set_page_config(
@@ -204,6 +240,29 @@ CUSTOM_CSS = """
         line-height: 1.6;
     }
 
+    /* ---------- Info note (subtle, non-urgent) ---------- */
+    .gemifit-note {
+        background-color: #12201c;
+        border: 1px solid #223028;
+        color: #9fb3ac;
+        border-radius: 10px;
+        padding: 0.7rem 1rem;
+        margin: 0.9rem 0;
+        direction: rtl;
+        text-align: right;
+        font-size: 0.85rem;
+        line-height: 1.5;
+    }
+
+    /* ---------- Tables ---------- */
+    .stTable table, .stDataFrame, table {
+        direction: rtl;
+    }
+
+    .stTable th, .stTable td {
+        text-align: right !important;
+    }
+
     /* ---------- Metric result cards ---------- */
     .gemifit-metric-grid {
         display: flex;
@@ -242,6 +301,14 @@ CUSTOM_CSS = """
         font-size: 0.82rem;
         color: #9fb3ac;
         margin-top: 0.3rem;
+    }
+
+    /* Keep signed numbers (e.g. +2.3 / -1.5) from having their sign
+       flipped to the wrong side by the RTL bidi algorithm. */
+    .gemifit-ltr {
+        direction: ltr;
+        unicode-bidi: embed;
+        display: inline-block;
     }
 
     /* ---------- Hide Streamlit chrome ---------- */
@@ -308,12 +375,16 @@ with tab_calories:
         col1, col2 = st.columns(2)
         with col1:
             age = st.number_input("גיל", min_value=18, max_value=90, value=30, step=1)
+            st.caption(
+                "המחשבון מיועד לגילאי 18 ומעלה. "
+                "מתחת לגיל 18 — פנו לרופא או לדיאטן מוסמך."
+            )
             height = st.number_input(
-                "גובה בס\"מ", min_value=120, max_value=230, value=170, step=1
+                "גובה בס״מ", min_value=120, max_value=230, value=170, step=1
             )
         with col2:
             weight = st.number_input(
-                "משקל בק\"ג", min_value=35.0, max_value=250.0, value=70.0, step=0.5
+                "משקל בק״ג", min_value=35.0, max_value=250.0, value=70.0, step=0.5
             )
 
         activity_label = st.selectbox("רמת פעילות", list(ACTIVITY_FACTORS.keys()))
@@ -336,7 +407,7 @@ with tab_calories:
                 f"""
                 <div class="gemifit-caution">
                     ⚠️ שימו לב: היעד היומי המחושב היה נמוך מסף הבטיחות המומלץ,
-                    ולכן הוגדר לרף מינימלי של {plan['floor']} קק"ל ליום.
+                    ולכן הוגדר לרף מינימלי של {plan['floor']} קק״ל ליום.
                     מומלץ להתייעץ עם רופא/ה או דיאטן/ית מוסמך/ת לפני שממשיכים בתזונה דלה בקלוריות.
                 </div>
                 """,
@@ -370,10 +441,10 @@ with tab_calories:
         with st.expander("איך חישבנו?"):
             st.markdown(
                 f"""
-                קצב חילוף חומרים בסיסי (BMR): **{plan['bmr']} קק"ל** —
+                קצב חילוף חומרים בסיסי (BMR): **{plan['bmr']} קק״ל** —
                 כמות הקלוריות שהגוף שורף במנוחה מוחלטת.
 
-                הוצאה קלורית יומית כוללת (TDEE): **{plan['tdee']} קק"ל** —
+                הוצאה קלורית יומית כוללת (TDEE): **{plan['tdee']} קק״ל** —
                 ה-BMR מוכפל ברמת הפעילות שבחרתם.
 
                 מהערך הזה חישבנו את היעד היומי לפי המטרה שסימנתם, וחילקנו אותו
@@ -382,7 +453,133 @@ with tab_calories:
             )
 
 with tab_weight:
-    st.markdown(placeholder_html, unsafe_allow_html=True)
+    weight_df = get_weight_entries()
+
+    default_weight = (
+        float(weight_df.sort_values("date").iloc[-1]["weight_kg"])
+        if not weight_df.empty
+        else 70.0
+    )
+
+    with st.form("weight_entry_form"):
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            entry_date = st.date_input("תאריך", value=date.today())
+        with col2:
+            entry_weight = st.number_input(
+                "משקל בק״ג",
+                min_value=35.0,
+                max_value=250.0,
+                value=default_weight,
+                step=0.1,
+            )
+        with col3:
+            st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+            add_submitted = st.form_submit_button("הוסף מדידה")
+
+    if add_submitted:
+        weight_df = upsert_weight_entry(weight_df, entry_date, entry_weight)
+        st.session_state["weight_entries"] = weight_df
+        st.rerun()
+
+    if weight_df.empty:
+        st.markdown(
+            '<div class="gemifit-placeholder">'
+            "📈 עדיין אין מדידות. הוסיפו את המדידה הראשונה שלכם למעלה "
+            "כדי להתחיל לעקוב אחרי ההתקדמות שלכם."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        sorted_asc = weight_df.sort_values("date").reset_index(drop=True)
+        current_weight = sorted_asc.iloc[-1]["weight_kg"]
+        first_weight = sorted_asc.iloc[0]["weight_kg"]
+        change = current_weight - first_weight
+
+        st.markdown(
+            f"""
+            <div class="gemifit-metric-grid">
+                <div class="gemifit-metric-card">
+                    <div class="gemifit-metric-value">{current_weight:.1f}</div>
+                    <div class="gemifit-metric-label">משקל נוכחי</div>
+                </div>
+                <div class="gemifit-metric-card">
+                    <div class="gemifit-metric-value"><span class="gemifit-ltr">{change:+.1f}</span></div>
+                    <div class="gemifit-metric-label">שינוי מאז המדידה הראשונה</div>
+                </div>
+                <div class="gemifit-metric-card">
+                    <div class="gemifit-metric-value">{len(sorted_asc)}</div>
+                    <div class="gemifit-metric-label">מספר מדידות</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        chart_series = sorted_asc.set_index("date")["weight_kg"].rename("משקל בק״ג")
+        st.line_chart(chart_series)
+
+        sorted_desc = weight_df.sort_values("date", ascending=False).reset_index(drop=True)
+        display_df = pd.DataFrame(
+            {
+                "תאריך": sorted_desc["date"].apply(lambda d: d.strftime("%d/%m/%Y")),
+                "משקל בק״ג": sorted_desc["weight_kg"].apply(lambda w: f"{w:.1f}"),
+            }
+        )
+        display_df.index = display_df.index + 1
+        st.table(display_df)
+
+        st.markdown("##### מחיקת מדידה")
+        del_col1, del_col2 = st.columns([3, 1])
+        with del_col1:
+            date_to_delete = st.selectbox(
+                "תאריך למחיקה",
+                sorted_desc["date"].tolist(),
+                format_func=lambda d: d.strftime("%d/%m/%Y"),
+                label_visibility="collapsed",
+            )
+        with del_col2:
+            if st.button("מחק מדידה"):
+                weight_df = delete_weight_entry(weight_df, date_to_delete)
+                st.session_state["weight_entries"] = weight_df
+                st.rerun()
+
+    st.markdown("##### גיבוי ושחזור")
+
+    backup_csv = weight_df.assign(date=weight_df["date"].astype(str)).to_csv(index=False)
+    st.download_button(
+        "הורד גיבוי CSV",
+        data=backup_csv.encode("utf-8"),
+        file_name="gemifit_weight_backup.csv",
+        mime="text/csv",
+        disabled=weight_df.empty,
+    )
+
+    uploaded_backup = st.file_uploader("טען גיבוי", type=["csv"])
+    if uploaded_backup is not None:
+        backup_signature = (uploaded_backup.name, uploaded_backup.size)
+        if st.session_state.get("_weight_backup_signature") != backup_signature:
+            st.session_state["_weight_backup_signature"] = backup_signature
+            try:
+                restored_df = parse_weight_backup_csv(uploaded_backup)
+                st.session_state["weight_entries"] = restored_df
+                st.success("הגיבוי נטען בהצלחה!")
+                st.rerun()
+            except Exception:
+                st.error(
+                    "קובץ הגיבוי אינו תקין. ודאו שמדובר בקובץ CSV שהופק "
+                    "מהאפליקציה (עמודות date ו-weight_kg) ונסו שוב."
+                )
+
+    st.markdown(
+        """
+        <div class="gemifit-note">
+            ℹ️ הנתונים נשמרים למשך הביקור הנוכחי בלבד. כדי לשמור לאורך זמן —
+            הורידו גיבוי והעלו אותו בביקור הבא.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with tab_workout:
     st.markdown(placeholder_html, unsafe_allow_html=True)
