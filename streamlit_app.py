@@ -111,9 +111,14 @@ WORKOUT_SYSTEM_PROMPT = """\
 מבנה התשובה:
 1. שורת פתיחה קצרה אחת שמתארת את התוכנית.
 2. לכל יום אימון: כותרת מודגשת (לדוגמה **יום 1 — פלג גוף עליון**), שורת חימום \
-קצרה, ולאחריה רשימת תרגילים בפורמט: "שם התרגיל — 3x12, מנוחה 60 שניות" \
-(אפשר להוסיף את שם התרגיל באנגלית בסוגריים כשזה עוזר).
-3. ציון ברור אילו ימים הם ימי מנוחה.
+קצרה, ולאחריה רשימת תרגילים בפורמט: "שם התרגיל — 3x12, מנוחה 60 שניות". \
+לתרגילי קרדיו טהורים (כמו קפיצות פיסוק, הרמות ברכיים, ריצה במקום, ברפיז) \
+יש לציין משך זמן במקום מספר חזרות, לדוגמה "45 שניות, מנוחה 30 שניות". \
+לשם כל תרגיל יש לבחור שם עברי טבעי ומקובל אם קיים כזה, ואם לא — להשתמש בשם \
+הנפוץ בחדרי כושר; אסור בהחלט לערבב עברית ואנגלית באותו שם תרגיל.
+3. חלוקת ימי האימון לאורך השבוע, בלי לציין ימים ספציפיים (כמו "יום שני") — \
+יש לציין באופן כללי שיש לפזר את האימונים לאורך השבוע כך שיהיה לפחות יום \
+מנוחה אחד בין כל שני ימי אימון.
 4. בסיום, בדיוק 3 כללי בטיחות קצרים: טכניקה לפני משקל, עצירה מיידית אם יש \
 כאב, והתקדמות הדרגתית.
 5. שורת סיום אחת שאומרת שהתוכנית כללית, מיועדת למבוגרים בריאים, ושיש \
@@ -148,6 +153,78 @@ def generate_workout_plan(api_key, goal, level, days_per_week, duration_minutes,
             },
         ],
         temperature=0.4,
+        max_tokens=2500,
+    )
+    return response.choices[0].message.content
+
+
+NUTRITION_STYLES = ["רגיל", "צמחוני", "טבעוני"]
+MEALS_PER_DAY_OPTIONS = [3, 4, 5]
+
+NUTRITION_SYSTEM_PROMPT = """\
+את/ה בונה/ת תפריטי תזונה יומיים מעשיים בעברית טבעית וברורה.
+בנה/י תפריט ליום שלם אחד, מחולק למספר הארוחות שהתבקש.
+לכל ארוחה: כותרת מודגשת, פירוט מזונות עם כמויות מעשיות (גרם, יחידות, כוסות) \
+וכמות קלוריות משוערת לארוחה.
+סך הקלוריות היומי צריך להיות בטווח של כ-5% מהיעד שצוין.
+יש לכבד את סגנון התזונה שנבחר, את כללי הכשרות אם צוינו, ואת רשימת המאכלים \
+להימנעות.
+העדף/י מזונות פשוטים, זולים וזמינים בישראל.
+כלול/י שורה אחת על שתיית מים לאורך היום.
+אם המשתמש/ת ציין/ה אלרגיות, הוסף/י שורת אזהרה אחת שיש לבדוק את רכיבי \
+המוצרים באופן אישי.
+סיים/י בשורה שהתפריט כללי, מיועד למבוגרים בריאים, ושיש להתייעץ עם רופא/ה \
+או דיאטן/ית במקרה של ספק.
+לעולם אל תבנה/י תפריט מתחת ל-1200 קלוריות, ולעולם אל תמליץ/י על תוספי תזונה \
+ואל תיתן/י ייעוץ רפואי.
+"""
+
+
+def build_nutrition_user_prompt(
+    calorie_target, protein_g, carbs_g, fat_g, style, kosher, meals_per_day, avoid_foods
+):
+    macro_line = ""
+    if protein_g is not None:
+        macro_line = (
+            f"פילוח מקרו-נוטריאנטים יעד: חלבון {protein_g} גרם, "
+            f"פחמימות {carbs_g} גרם, שומן {fat_g} גרם.\n"
+        )
+
+    lines = [
+        f"יעד קלוריות יומי: {calorie_target} קלוריות",
+        macro_line,
+        f"סגנון תזונה: {style}",
+        f"שומר/ת כשרות: {'כן — ללא חזיר ופירות ים, ואיסור ערבוב בשר וחלב באותה ארוחה' if kosher else 'לא'}",
+        f"מספר ארוחות ביום: {meals_per_day}",
+        f"מאכלים להימנעות (אלרגיות או העדפות): {avoid_foods if avoid_foods.strip() else 'אין'}",
+        "בנה/י עבורי תפריט יומי מותאם.",
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def generate_nutrition_menu(
+    api_key, calorie_target, protein_g, carbs_g, fat_g, style, kosher, meals_per_day, avoid_foods
+):
+    client = groq.Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": NUTRITION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_nutrition_user_prompt(
+                    calorie_target,
+                    protein_g,
+                    carbs_g,
+                    fat_g,
+                    style,
+                    kosher,
+                    meals_per_day,
+                    avoid_foods,
+                ),
+            },
+        ],
+        temperature=0.45,
         max_tokens=2500,
     )
     return response.choices[0].message.content
@@ -706,4 +783,92 @@ with tab_workout:
             )
 
 with tab_nutrition:
-    st.markdown(placeholder_html, unsafe_allow_html=True)
+    try:
+        nutrition_api_key = st.secrets.get("GROQ_API_KEY")
+    except st.errors.StreamlitSecretNotFoundError:
+        nutrition_api_key = None
+
+    if not nutrition_api_key:
+        st.markdown(
+            """
+            <div class="gemifit-warning">
+                ⚠️ חסר מפתח AI. יש להגדיר GROQ_API_KEY בהגדרות הסודות של האתר.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        calorie_plan = st.session_state.get("calorie_plan")
+
+        if calorie_plan:
+            st.markdown(
+                f"התפריט מבוסס על היעד שחישבת: "
+                f"**{calorie_plan['target_calories']} קלוריות**."
+            )
+            calorie_target = calorie_plan["target_calories"]
+            protein_g = calorie_plan["protein_g"]
+            carbs_g = calorie_plan["carbs_g"]
+            fat_g = calorie_plan["fat_g"]
+        else:
+            calorie_target = st.number_input(
+                "יעד קלוריות יומי",
+                min_value=1200,
+                max_value=4000,
+                value=2000,
+                step=50,
+            )
+            st.caption("טיפ: בתפריט מחשבון קלוריות תוכלו לחשב יעד קלוריות מותאם אישית.")
+            protein_g = carbs_g = fat_g = None
+
+        with st.form("nutrition_menu_form"):
+            style = st.radio("סגנון תזונה", NUTRITION_STYLES, horizontal=True)
+            kosher = st.checkbox("שומר/ת כשרות")
+            meals_per_day = st.radio(
+                "מספר ארוחות ביום", MEALS_PER_DAY_OPTIONS, horizontal=True
+            )
+            avoid_foods = st.text_input(
+                "מאכלים להימנע מהם (אלרגיות או העדפות) — לא חובה"
+            )
+
+            nutrition_submitted = st.form_submit_button("צור לי תפריט")
+
+        if nutrition_submitted:
+            with st.spinner("מרכיב לך תפריט..."):
+                try:
+                    menu_text = generate_nutrition_menu(
+                        nutrition_api_key,
+                        calorie_target,
+                        protein_g,
+                        carbs_g,
+                        fat_g,
+                        style,
+                        kosher,
+                        meals_per_day,
+                        avoid_foods,
+                    )
+                    st.session_state["nutrition_menu"] = menu_text
+                    st.session_state.pop("nutrition_error", None)
+                except groq.RateLimitError:
+                    st.session_state["nutrition_error"] = (
+                        "המכסה היומית של ה-AI הסתיימה — נסו שוב מאוחר יותר."
+                    )
+                    st.session_state.pop("nutrition_menu", None)
+                except groq.APIError:
+                    st.session_state["nutrition_error"] = (
+                        "אירעה שגיאה בתקשורת עם שירות ה-AI. נסו שוב בעוד כמה רגעים."
+                    )
+                    st.session_state.pop("nutrition_menu", None)
+
+        nutrition_error = st.session_state.get("nutrition_error")
+        if nutrition_error:
+            st.error(nutrition_error)
+
+        nutrition_menu = st.session_state.get("nutrition_menu")
+        if nutrition_menu:
+            st.markdown(nutrition_menu)
+            st.download_button(
+                "הורד את התפריט",
+                data=nutrition_menu.encode("utf-8"),
+                file_name="gemifit_nutrition_menu.txt",
+                mime="text/plain",
+            )
