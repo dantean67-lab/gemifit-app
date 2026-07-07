@@ -1,5 +1,6 @@
 from datetime import date
 
+import gspread
 import groq
 import pandas as pd
 
@@ -85,6 +86,70 @@ def delete_weight_entry(df, entry_date):
     return df[df["date"] != entry_date].reset_index(drop=True)
 
 
+def render_weight_stats_and_history(entries_df, on_delete):
+    if entries_df.empty:
+        st.markdown(
+            '<div class="gemifit-placeholder">'
+            "📈 עדיין אין מדידות. הוסיפו את המדידה הראשונה שלכם למעלה "
+            "כדי להתחיל לעקוב אחרי ההתקדמות שלכם."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    sorted_asc = entries_df.sort_values("date").reset_index(drop=True)
+    current_weight = sorted_asc.iloc[-1]["weight_kg"]
+    first_weight = sorted_asc.iloc[0]["weight_kg"]
+    change = current_weight - first_weight
+
+    st.markdown(
+        f"""
+        <div class="gemifit-metric-grid">
+            <div class="gemifit-metric-card">
+                <div class="gemifit-metric-value">{current_weight:.1f}</div>
+                <div class="gemifit-metric-label">משקל נוכחי</div>
+            </div>
+            <div class="gemifit-metric-card">
+                <div class="gemifit-metric-value"><span class="gemifit-ltr">{change:+.1f}</span></div>
+                <div class="gemifit-metric-label">שינוי מאז המדידה הראשונה</div>
+            </div>
+            <div class="gemifit-metric-card">
+                <div class="gemifit-metric-value">{len(sorted_asc)}</div>
+                <div class="gemifit-metric-label">מספר מדידות</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    chart_series = sorted_asc.set_index("date")["weight_kg"].rename("משקל בק״ג")
+    st.line_chart(chart_series)
+
+    sorted_desc = entries_df.sort_values("date", ascending=False).reset_index(drop=True)
+    display_df = pd.DataFrame(
+        {
+            "תאריך": sorted_desc["date"].apply(lambda d: d.strftime("%d/%m/%Y")),
+            "משקל בק״ג": sorted_desc["weight_kg"].apply(lambda w: f"{w:.1f}"),
+        }
+    )
+    display_df.index = display_df.index + 1
+    st.table(display_df)
+
+    st.markdown("##### מחיקת מדידה")
+    del_col1, del_col2 = st.columns([3, 1])
+    with del_col1:
+        date_to_delete = st.selectbox(
+            "תאריך למחיקה",
+            sorted_desc["date"].tolist(),
+            format_func=lambda d: d.strftime("%d/%m/%Y"),
+            label_visibility="collapsed",
+            key="weight_delete_select",
+        )
+    with del_col2:
+        if st.button("מחק מדידה", key="weight_delete_btn"):
+            on_delete(date_to_delete)
+
+
 def parse_weight_backup_csv(uploaded_file):
     backup_df = pd.read_csv(uploaded_file)
     if list(backup_df.columns) != WEIGHT_BACKUP_COLUMNS:
@@ -95,6 +160,122 @@ def parse_weight_backup_csv(uploaded_file):
     backup_df["date"] = pd.to_datetime(backup_df["date"], format="%Y-%m-%d").dt.date
     backup_df["weight_kg"] = pd.to_numeric(backup_df["weight_kg"])
     return backup_df.sort_values("date").reset_index(drop=True)
+
+
+def is_auth_configured():
+    try:
+        return bool(st.secrets.get("auth"))
+    except st.errors.StreamlitSecretNotFoundError:
+        return False
+
+
+def get_logged_in_user():
+    """Returns the logged-in user's email, or None in guest mode / on any error."""
+    if not is_auth_configured():
+        return None
+    try:
+        if st.user.is_logged_in:
+            return st.user.email
+    except Exception:
+        return None
+    return None
+
+
+def get_logged_in_display_name():
+    try:
+        return getattr(st.user, "given_name", None) or getattr(st.user, "name", None) or st.user.email
+    except Exception:
+        return None
+
+
+def is_gsheets_configured():
+    try:
+        gsheets_secrets = st.secrets.get("connections", {}).get("gsheets")
+    except st.errors.StreamlitSecretNotFoundError:
+        return False
+    return bool(gsheets_secrets)
+
+
+CLOUD_WEIGHT_WORKSHEET = "weights"
+CLOUD_WEIGHT_COLUMNS = ["email", "date", "weight_kg"]
+
+
+@st.cache_resource(show_spinner=False)
+def get_cloud_weight_worksheet():
+    gsheets_secrets = dict(st.secrets["connections"]["gsheets"])
+    spreadsheet_ref = gsheets_secrets.pop("spreadsheet")
+
+    client = gspread.service_account_from_dict(gsheets_secrets)
+    spreadsheet = (
+        client.open_by_url(spreadsheet_ref)
+        if spreadsheet_ref.startswith("http")
+        else client.open_by_key(spreadsheet_ref)
+    )
+
+    try:
+        worksheet = spreadsheet.worksheet(CLOUD_WEIGHT_WORKSHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=CLOUD_WEIGHT_WORKSHEET, rows=1000, cols=len(CLOUD_WEIGHT_COLUMNS)
+        )
+        worksheet.update(range_name="A1", values=[CLOUD_WEIGHT_COLUMNS])
+
+    return worksheet
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _read_all_cloud_weight_rows():
+    worksheet = get_cloud_weight_worksheet()
+    records = worksheet.get_all_records(expected_headers=CLOUD_WEIGHT_COLUMNS)
+    df = pd.DataFrame(records, columns=CLOUD_WEIGHT_COLUMNS)
+
+    df["email"] = df["email"].astype(str).str.strip()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["weight_kg"] = pd.to_numeric(df["weight_kg"], errors="coerce")
+    df = df.dropna(subset=["email", "date", "weight_kg"])
+    return df[df["email"] != ""].reset_index(drop=True)
+
+
+def load_all_cloud_weight_rows(fresh=False):
+    if fresh:
+        st.cache_data.clear()
+    return _read_all_cloud_weight_rows()
+
+
+def save_all_cloud_weight_rows(df):
+    worksheet = get_cloud_weight_worksheet()
+    sorted_df = df.sort_values(["email", "date"]).reset_index(drop=True)
+    values = [CLOUD_WEIGHT_COLUMNS] + [
+        [row.email, row.date.isoformat(), row.weight_kg] for row in sorted_df.itertuples(index=False)
+    ]
+    worksheet.clear()
+    worksheet.update(range_name="A1", values=values)
+    st.cache_data.clear()
+
+
+def get_user_cloud_weight_entries(email):
+    all_rows = load_all_cloud_weight_rows()
+    user_rows = all_rows[all_rows["email"] == email][["date", "weight_kg"]]
+    return user_rows.sort_values("date").reset_index(drop=True)
+
+
+def upsert_cloud_weight_entry(email, entry_date, weight_kg):
+    all_rows = load_all_cloud_weight_rows(fresh=True)
+    other_rows = all_rows[~((all_rows["email"] == email) & (all_rows["date"] == entry_date))]
+    new_row = pd.DataFrame([{"email": email, "date": entry_date, "weight_kg": weight_kg}])
+    save_all_cloud_weight_rows(pd.concat([other_rows, new_row], ignore_index=True))
+
+
+def delete_cloud_weight_entry(email, entry_date):
+    all_rows = load_all_cloud_weight_rows(fresh=True)
+    remaining = all_rows[~((all_rows["email"] == email) & (all_rows["date"] == entry_date))]
+    save_all_cloud_weight_rows(remaining)
+
+
+def delete_all_cloud_weight_entries(email):
+    all_rows = load_all_cloud_weight_rows(fresh=True)
+    remaining = all_rows[all_rows["email"] != email]
+    save_all_cloud_weight_rows(remaining)
 
 
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -339,6 +520,15 @@ CUSTOM_CSS = """
         margin-bottom: 1rem;
     }
 
+    /* ---------- Auth bar ---------- */
+    .gemifit-auth-greeting {
+        text-align: center;
+        color: #9fb3ac;
+        font-size: 0.9rem;
+        font-weight: 600;
+        margin-bottom: 0.3rem;
+    }
+
     /* ---------- Warning box ---------- */
     .gemifit-warning {
         background-color: #2a1f0d;
@@ -491,6 +681,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if is_auth_configured():
+    try:
+        user_is_logged_in = st.user.is_logged_in
+    except Exception:
+        user_is_logged_in = False
+
+    auth_col, _ = st.columns([1.4, 3])
+    with auth_col:
+        if user_is_logged_in:
+            st.markdown(
+                f'<div class="gemifit-auth-greeting">שלום, {get_logged_in_display_name()}</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("התנתק", key="gemifit_logout_btn", use_container_width=True):
+                st.logout()
+        else:
+            if st.button("התחבר עם גוגל", key="gemifit_login_btn", use_container_width=True):
+                st.login()
+
 st.markdown(
     """
     <div class="gemifit-warning">
@@ -592,133 +801,187 @@ with tab_calories:
             )
 
 with tab_weight:
-    weight_df = get_weight_entries()
+    current_user_email = get_logged_in_user()
 
-    default_weight = (
-        float(weight_df.sort_values("date").iloc[-1]["weight_kg"])
-        if not weight_df.empty
-        else 70.0
-    )
+    if current_user_email:
+        st.caption("מה נשמר: כתובת האימייל והמדידות שלך בלבד.")
 
-    with st.form("weight_entry_form"):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            entry_date = st.date_input("תאריך", value=date.today())
-        with col2:
-            entry_weight = st.number_input(
-                "משקל בק״ג",
-                min_value=35.0,
-                max_value=250.0,
-                value=default_weight,
-                step=0.1,
+        if not is_gsheets_configured():
+            st.error(
+                "חסרה הגדרת שמירת נתונים בענן (Google Sheets). "
+                "פנו למנהל האתר כדי להשלים את ההגדרה — בינתיים לא ניתן לשמור מדידות."
             )
-        with col3:
-            st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
-            add_submitted = st.form_submit_button("הוסף מדידה")
+        else:
+            try:
+                cloud_entries = get_user_cloud_weight_entries(current_user_email)
+                cloud_load_error = None
+            except Exception:
+                cloud_entries = pd.DataFrame(columns=WEIGHT_BACKUP_COLUMNS)
+                cloud_load_error = "אירעה שגיאה בטעינת הנתונים מהענן. נסו לרענן את הדף בעוד רגע."
 
-    if add_submitted:
-        weight_df = upsert_weight_entry(weight_df, entry_date, entry_weight)
-        st.session_state["weight_entries"] = weight_df
-        st.rerun()
+            if cloud_load_error:
+                st.error(cloud_load_error)
 
-    if weight_df.empty:
-        st.markdown(
-            '<div class="gemifit-placeholder">'
-            "📈 עדיין אין מדידות. הוסיפו את המדידה הראשונה שלכם למעלה "
-            "כדי להתחיל לעקוב אחרי ההתקדמות שלכם."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+            default_weight = (
+                float(cloud_entries.sort_values("date").iloc[-1]["weight_kg"])
+                if not cloud_entries.empty
+                else 70.0
+            )
+
+            with st.form("weight_entry_form_cloud"):
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    entry_date = st.date_input("תאריך", value=date.today())
+                with col2:
+                    entry_weight = st.number_input(
+                        "משקל בק״ג",
+                        min_value=35.0,
+                        max_value=250.0,
+                        value=default_weight,
+                        step=0.1,
+                    )
+                with col3:
+                    st.markdown(
+                        "<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True
+                    )
+                    add_submitted = st.form_submit_button("הוסף מדידה")
+
+            if add_submitted:
+                try:
+                    upsert_cloud_weight_entry(current_user_email, entry_date, entry_weight)
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "אירעה שגיאה בשמירת המדידה בענן. המדידה שהזנתם לא נשמרה — נסו שוב."
+                    )
+
+            def _cloud_delete_entry(entry_date_to_delete):
+                try:
+                    delete_cloud_weight_entry(current_user_email, entry_date_to_delete)
+                    st.rerun()
+                except Exception:
+                    st.error("אירעה שגיאה במחיקת המדידה. נסו שוב.")
+
+            render_weight_stats_and_history(cloud_entries, _cloud_delete_entry)
+
+            st.markdown("##### גיבוי")
+            backup_csv = cloud_entries.assign(date=cloud_entries["date"].astype(str)).to_csv(
+                index=False
+            )
+            st.download_button(
+                "הורד גיבוי CSV",
+                data=backup_csv.encode("utf-8"),
+                file_name="gemifit_weight_backup.csv",
+                mime="text/csv",
+                disabled=cloud_entries.empty,
+                key="cloud_backup_download",
+            )
+
+            st.markdown(
+                """
+                <div class="gemifit-note">
+                    ☁️ המדידות שלך נשמרות בחשבון שלך בענן.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("##### מחיקת כל הנתונים שלי")
+            if st.session_state.get("confirm_delete_all_weight"):
+                st.warning("פעולה זו תמחק לצמיתות את כל המדידות שלך. האם להמשיך?")
+                confirm_col1, confirm_col2 = st.columns(2)
+                with confirm_col1:
+                    if st.button("כן, מחק את כל הנתונים שלי", key="confirm_delete_all_yes"):
+                        try:
+                            delete_all_cloud_weight_entries(current_user_email)
+                            st.session_state["confirm_delete_all_weight"] = False
+                            st.success("כל הנתונים נמחקו.")
+                            st.rerun()
+                        except Exception:
+                            st.error("אירעה שגיאה במחיקת הנתונים. נסו שוב.")
+                with confirm_col2:
+                    if st.button("ביטול", key="confirm_delete_all_no"):
+                        st.session_state["confirm_delete_all_weight"] = False
+                        st.rerun()
+            else:
+                if st.button("מחק את כל הנתונים שלי", key="delete_all_weight_btn"):
+                    st.session_state["confirm_delete_all_weight"] = True
+                    st.rerun()
+
     else:
-        sorted_asc = weight_df.sort_values("date").reset_index(drop=True)
-        current_weight = sorted_asc.iloc[-1]["weight_kg"]
-        first_weight = sorted_asc.iloc[0]["weight_kg"]
-        change = current_weight - first_weight
+        weight_df = get_weight_entries()
+
+        default_weight = (
+            float(weight_df.sort_values("date").iloc[-1]["weight_kg"])
+            if not weight_df.empty
+            else 70.0
+        )
+
+        with st.form("weight_entry_form"):
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                entry_date = st.date_input("תאריך", value=date.today())
+            with col2:
+                entry_weight = st.number_input(
+                    "משקל בק״ג",
+                    min_value=35.0,
+                    max_value=250.0,
+                    value=default_weight,
+                    step=0.1,
+                )
+            with col3:
+                st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+                add_submitted = st.form_submit_button("הוסף מדידה")
+
+        if add_submitted:
+            weight_df = upsert_weight_entry(weight_df, entry_date, entry_weight)
+            st.session_state["weight_entries"] = weight_df
+            st.rerun()
+
+        def _guest_delete_entry(entry_date_to_delete):
+            updated = delete_weight_entry(get_weight_entries(), entry_date_to_delete)
+            st.session_state["weight_entries"] = updated
+            st.rerun()
+
+        render_weight_stats_and_history(weight_df, _guest_delete_entry)
+
+        st.markdown("##### גיבוי ושחזור")
+
+        backup_csv = weight_df.assign(date=weight_df["date"].astype(str)).to_csv(index=False)
+        st.download_button(
+            "הורד גיבוי CSV",
+            data=backup_csv.encode("utf-8"),
+            file_name="gemifit_weight_backup.csv",
+            mime="text/csv",
+            disabled=weight_df.empty,
+            key="guest_backup_download",
+        )
+
+        uploaded_backup = st.file_uploader("טען גיבוי", type=["csv"])
+        if uploaded_backup is not None:
+            backup_signature = (uploaded_backup.name, uploaded_backup.size)
+            if st.session_state.get("_weight_backup_signature") != backup_signature:
+                st.session_state["_weight_backup_signature"] = backup_signature
+                try:
+                    restored_df = parse_weight_backup_csv(uploaded_backup)
+                    st.session_state["weight_entries"] = restored_df
+                    st.success("הגיבוי נטען בהצלחה!")
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "קובץ הגיבוי אינו תקין. ודאו שמדובר בקובץ CSV שהופק "
+                        "מהאפליקציה (עמודות date ו-weight_kg) ונסו שוב."
+                    )
 
         st.markdown(
-            f"""
-            <div class="gemifit-metric-grid">
-                <div class="gemifit-metric-card">
-                    <div class="gemifit-metric-value">{current_weight:.1f}</div>
-                    <div class="gemifit-metric-label">משקל נוכחי</div>
-                </div>
-                <div class="gemifit-metric-card">
-                    <div class="gemifit-metric-value"><span class="gemifit-ltr">{change:+.1f}</span></div>
-                    <div class="gemifit-metric-label">שינוי מאז המדידה הראשונה</div>
-                </div>
-                <div class="gemifit-metric-card">
-                    <div class="gemifit-metric-value">{len(sorted_asc)}</div>
-                    <div class="gemifit-metric-label">מספר מדידות</div>
-                </div>
+            """
+            <div class="gemifit-note">
+                ℹ️ הנתונים נשמרים למשך הביקור הנוכחי בלבד. כדי לשמור לאורך זמן —
+                הורידו גיבוי והעלו אותו בביקור הבא.
             </div>
             """,
             unsafe_allow_html=True,
         )
-
-        chart_series = sorted_asc.set_index("date")["weight_kg"].rename("משקל בק״ג")
-        st.line_chart(chart_series)
-
-        sorted_desc = weight_df.sort_values("date", ascending=False).reset_index(drop=True)
-        display_df = pd.DataFrame(
-            {
-                "תאריך": sorted_desc["date"].apply(lambda d: d.strftime("%d/%m/%Y")),
-                "משקל בק״ג": sorted_desc["weight_kg"].apply(lambda w: f"{w:.1f}"),
-            }
-        )
-        display_df.index = display_df.index + 1
-        st.table(display_df)
-
-        st.markdown("##### מחיקת מדידה")
-        del_col1, del_col2 = st.columns([3, 1])
-        with del_col1:
-            date_to_delete = st.selectbox(
-                "תאריך למחיקה",
-                sorted_desc["date"].tolist(),
-                format_func=lambda d: d.strftime("%d/%m/%Y"),
-                label_visibility="collapsed",
-            )
-        with del_col2:
-            if st.button("מחק מדידה"):
-                weight_df = delete_weight_entry(weight_df, date_to_delete)
-                st.session_state["weight_entries"] = weight_df
-                st.rerun()
-
-    st.markdown("##### גיבוי ושחזור")
-
-    backup_csv = weight_df.assign(date=weight_df["date"].astype(str)).to_csv(index=False)
-    st.download_button(
-        "הורד גיבוי CSV",
-        data=backup_csv.encode("utf-8"),
-        file_name="gemifit_weight_backup.csv",
-        mime="text/csv",
-        disabled=weight_df.empty,
-    )
-
-    uploaded_backup = st.file_uploader("טען גיבוי", type=["csv"])
-    if uploaded_backup is not None:
-        backup_signature = (uploaded_backup.name, uploaded_backup.size)
-        if st.session_state.get("_weight_backup_signature") != backup_signature:
-            st.session_state["_weight_backup_signature"] = backup_signature
-            try:
-                restored_df = parse_weight_backup_csv(uploaded_backup)
-                st.session_state["weight_entries"] = restored_df
-                st.success("הגיבוי נטען בהצלחה!")
-                st.rerun()
-            except Exception:
-                st.error(
-                    "קובץ הגיבוי אינו תקין. ודאו שמדובר בקובץ CSV שהופק "
-                    "מהאפליקציה (עמודות date ו-weight_kg) ונסו שוב."
-                )
-
-    st.markdown(
-        """
-        <div class="gemifit-note">
-            ℹ️ הנתונים נשמרים למשך הביקור הנוכחי בלבד. כדי לשמור לאורך זמן —
-            הורידו גיבוי והעלו אותו בביקור הבא.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 with tab_workout:
     try:
