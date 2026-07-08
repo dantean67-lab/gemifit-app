@@ -1,8 +1,13 @@
+import base64
+import hashlib
+import io
+import json
 from datetime import date
 
 import gspread
 import groq
 import pandas as pd
+from PIL import Image
 
 import streamlit as st
 
@@ -578,6 +583,119 @@ def generate_nutrition_menu(
     return response.choices[0].message.content
 
 
+FOOD_SCANNER_MODEL = "qwen/qwen3.6-27b"
+FOOD_SCANNER_UNAVAILABLE_MESSAGE = "המודל הנסיוני לא זמין כרגע - נסו שוב מאוחר יותר."
+
+FOOD_SCANNER_SYSTEM_PROMPT = """\
+את/ה עוזר/ת תזונה שמזהה מאכלים בתמונות עבור קהל ישראלי, ומעריך/ה ערכים \
+תזונתיים בזהירות ובשמרנות — אם יש ספק לגבי גודל המנה או הרכיבים, העדף/י \
+הערכה נמוכה יותר על פני הערכה גבוהה.
+זהה/י את פריטי המזון בתמונה, והערך/כי לכל פריט גודל מנה מציאותי (בגרם, \
+יחידות או כוסות) וערכים תזונתיים.
+החזר/החזירי אך ורק JSON תקין במבנה הבא, ללא שום טקסט נוסף לפני או אחרי, \
+וללא סימוני קוד כמו ```:
+{"items":[{"name_he":"","portion_est":"","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}],"confidence":"גבוהה/בינונית/נמוכה","note_he":""}
+אם התמונה אינה מציגה אוכל, החזר/החזירי רשימת items ריקה, וב-note_he הסבר/י \
+בקצרה מה רואים בתמונה במקום זאת.
+לעולם אל תיתן/י ייעוץ רפואי.
+"""
+
+
+def downscale_image_for_scan(image_bytes, max_side=1024, jpeg_quality=85):
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.convert("RGB")
+
+    width, height = img.size
+    if max(width, height) > max_side:
+        scale = max_side / max(width, height)
+        img = img.resize((max(1, round(width * scale)), max(1, round(height * scale))))
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=jpeg_quality)
+    return buffer.getvalue()
+
+
+def _call_food_scan_model(client, messages, **kwargs):
+    return client.chat.completions.create(
+        model=FOOD_SCANNER_MODEL,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=1200,
+        **kwargs,
+    )
+
+
+def scan_food_image(api_key, image_bytes):
+    resized_bytes = downscale_image_for_scan(image_bytes)
+    b64_image = base64.b64encode(resized_bytes).decode("utf-8")
+
+    client = groq.Groq(api_key=api_key)
+    messages = [
+        {"role": "system", "content": FOOD_SCANNER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "זהה את המאכלים בתמונה והחזר JSON לפי ההנחיות בלבד."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                },
+            ],
+        },
+    ]
+
+    # Preview model: some parameter combinations may not be supported yet,
+    # so degrade gracefully instead of failing the whole scan on a 400.
+    attempts = [
+        {"reasoning_effort": "none", "response_format": {"type": "json_object"}},
+        {"response_format": {"type": "json_object"}},
+        {},
+    ]
+    last_error = None
+    for kwargs in attempts:
+        try:
+            response = _call_food_scan_model(client, messages, **kwargs)
+            return response.choices[0].message.content
+        except groq.BadRequestError as exc:
+            last_error = exc
+    raise last_error
+
+
+def _strip_code_fences(text):
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def parse_food_scan_response(content):
+    data = json.loads(_strip_code_fences(content))
+
+    items = []
+    for raw_item in data.get("items") or []:
+        items.append(
+            {
+                "name_he": str(raw_item.get("name_he", "")).strip(),
+                "portion_est": str(raw_item.get("portion_est", "")).strip(),
+                "calories": int(raw_item.get("calories") or 0),
+                "protein_g": int(raw_item.get("protein_g") or 0),
+                "carbs_g": int(raw_item.get("carbs_g") or 0),
+                "fat_g": int(raw_item.get("fat_g") or 0),
+            }
+        )
+
+    return {
+        "items": items,
+        "confidence": str(data.get("confidence", "")).strip(),
+        "note_he": str(data.get("note_he", "")).strip(),
+    }
+
+
 st.set_page_config(
     page_title="ג'מי כושר",
     page_icon="💪",
@@ -794,6 +912,41 @@ CUSTOM_CSS = """
         margin-top: 0.3rem;
     }
 
+    /* ---------- Food scanner cards ---------- */
+    .gemifit-food-card {
+        background-color: #161b22;
+        border: 1px solid #223028;
+        border-radius: 12px;
+        padding: 0.9rem 1.1rem;
+        margin-bottom: 0.7rem;
+        direction: rtl;
+        text-align: right;
+    }
+
+    .gemifit-food-card .food-name {
+        font-weight: 700;
+        font-size: 1.05rem;
+        color: #e6edf3;
+    }
+
+    .gemifit-food-card .food-portion {
+        color: #9fb3ac;
+        font-size: 0.85rem;
+        margin: 0.15rem 0 0.5rem 0;
+    }
+
+    .gemifit-food-card .food-macros {
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+        font-size: 0.88rem;
+        color: #b6c2c9;
+    }
+
+    .gemifit-food-card .food-macros b {
+        color: #34e0a1;
+    }
+
     /* Keep signed numbers (e.g. +2.3 / -1.5) from having their sign
        flipped to the wrong side by the RTL bidi algorithm. */
     .gemifit-ltr {
@@ -872,8 +1025,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_calories, tab_weight, tab_workout, tab_nutrition = st.tabs(
-    ["מחשבון קלוריות", "מעקב משקל", "תוכנית אימון", "תפריט תזונה"]
+tab_calories, tab_weight, tab_workout, tab_nutrition, tab_scanner = st.tabs(
+    ["מחשבון קלוריות", "מעקב משקל", "תוכנית אימון", "תפריט תזונה", "סורק אוכל"]
 )
 
 placeholder_html = '<div class="gemifit-placeholder">🚧 בקרוב...</div>'
@@ -1257,6 +1410,7 @@ with tab_workout:
                     st.session_state["workout_error"] = (
                         "המכסה היומית של ה-AI הסתיימה — נסו שוב מאוחר יותר."
                     )
+                    
                     st.session_state.pop("workout_plan", None)
                 except groq.APIError:
                     st.session_state["workout_error"] = (
@@ -1369,3 +1523,180 @@ with tab_nutrition:
                 file_name="gemifit_nutrition_menu.txt",
                 mime="text/plain",
             )
+
+with tab_scanner:
+    try:
+        scanner_api_key = st.secrets.get("GROQ_API_KEY")
+    except st.errors.StreamlitSecretNotFoundError:
+        scanner_api_key = None
+
+    if not scanner_api_key:
+        st.markdown(
+            """
+            <div class="gemifit-warning">
+                ⚠️ חסר מפתח AI. יש להגדיר GROQ_API_KEY בהגדרות הסודות של האתר.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        food_log = st.session_state.setdefault("food_log_items", [])
+        log_total_calories = sum(item["calories"] for item in food_log)
+        log_total_protein = sum(item["protein_g"] for item in food_log)
+
+        st.markdown(
+            f"""
+            <div class="gemifit-metric-grid">
+                <div class="gemifit-metric-card highlight">
+                    <div class="gemifit-metric-value">{log_total_calories}</div>
+                    <div class="gemifit-metric-label">קלוריות היום</div>
+                </div>
+                <div class="gemifit-metric-card">
+                    <div class="gemifit-metric-value">{log_total_protein}</div>
+                    <div class="gemifit-metric-label">חלבון היום (גרם)</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        calorie_plan = st.session_state.get("calorie_plan")
+        if calorie_plan:
+            target_calories = calorie_plan["target_calories"]
+            progress_ratio = (
+                min(log_total_calories / target_calories, 1.0) if target_calories else 0.0
+            )
+            st.progress(progress_ratio)
+            st.markdown(
+                f"<div style='text-align:center; font-size:0.9rem; color:#9fb3ac;'>"
+                f"<span class='gemifit-ltr'>{log_total_calories}</span> מתוך "
+                f"<span class='gemifit-ltr'>{target_calories}</span> קק״ל יעד יומי</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+        st.markdown("##### 📷 סרוק ארוחה חדשה")
+
+        camera_photo = st.camera_input("צלם את האוכל")
+        uploaded_photo = st.file_uploader("או העלה תמונה", type=["jpg", "jpeg", "png"])
+        image_file = camera_photo if camera_photo is not None else uploaded_photo
+
+        if image_file is not None:
+            image_bytes = image_file.getvalue()
+            image_signature = hashlib.sha256(image_bytes).hexdigest()
+            if st.session_state.get("_food_scan_signature") != image_signature:
+                st.session_state["_food_scan_signature"] = image_signature
+                with st.spinner("מזהה את האוכל בתמונה..."):
+                    try:
+                        raw_content = scan_food_image(scanner_api_key, image_bytes)
+                        st.session_state["food_scan_result"] = parse_food_scan_response(
+                            raw_content
+                        )
+                        st.session_state.pop("food_scan_error", None)
+                    except groq.RateLimitError:
+                        st.session_state["food_scan_error"] = (
+                            "המכסה היומית של ה-AI הסתיימה — נסו שוב מאוחר יותר."
+                        )
+                        st.session_state.pop("food_scan_result", None)
+                    except groq.APIError:
+                        st.session_state["food_scan_error"] = FOOD_SCANNER_UNAVAILABLE_MESSAGE
+                        st.session_state.pop("food_scan_result", None)
+                    except Exception:
+                        st.session_state["food_scan_error"] = (
+                            "אירעה שגיאה בעיבוד התמונה או בפענוח התוצאה. נסו שוב עם תמונה אחרת."
+                        )
+                        st.session_state.pop("food_scan_result", None)
+
+        scan_error = st.session_state.get("food_scan_error")
+        if scan_error:
+            st.error(scan_error)
+
+        scan_result = st.session_state.get("food_scan_result")
+        if scan_result:
+            if not scan_result["items"]:
+                st.info(scan_result["note_he"] or "לא זוהה אוכל בתמונה.")
+            else:
+                for item in scan_result["items"]:
+                    st.markdown(
+                        f"""
+                        <div class="gemifit-food-card">
+                            <div class="food-name">{item['name_he']}</div>
+                            <div class="food-portion">{item['portion_est']}</div>
+                            <div class="food-macros">
+                                <span>קלוריות: <b>{item['calories']}</b></span>
+                                <span>חלבון: <b>{item['protein_g']}</b> גרם</span>
+                                <span>פחמימות: <b>{item['carbs_g']}</b> גרם</span>
+                                <span>שומן: <b>{item['fat_g']}</b> גרם</span>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                scan_total_calories = sum(item["calories"] for item in scan_result["items"])
+                scan_total_protein = sum(item["protein_g"] for item in scan_result["items"])
+                scan_total_carbs = sum(item["carbs_g"] for item in scan_result["items"])
+                scan_total_fat = sum(item["fat_g"] for item in scan_result["items"])
+
+                st.markdown(
+                    f"""
+                    <div class="gemifit-metric-grid">
+                        <div class="gemifit-metric-card highlight">
+                            <div class="gemifit-metric-value">{scan_total_calories}</div>
+                            <div class="gemifit-metric-label">סה״כ קלוריות</div>
+                        </div>
+                        <div class="gemifit-metric-card">
+                            <div class="gemifit-metric-value">{scan_total_protein}</div>
+                            <div class="gemifit-metric-label">חלבון (גרם)</div>
+                        </div>
+                        <div class="gemifit-metric-card">
+                            <div class="gemifit-metric-value">{scan_total_carbs}</div>
+                            <div class="gemifit-metric-label">פחמימות (גרם)</div>
+                        </div>
+                        <div class="gemifit-metric-card">
+                            <div class="gemifit-metric-value">{scan_total_fat}</div>
+                            <div class="gemifit-metric-label">שומן (גרם)</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(f"רמת ביטחון בזיהוי: **{scan_result['confidence']}**")
+                if scan_result["note_he"]:
+                    st.caption(scan_result["note_he"])
+
+                if st.button("הוסף ליומן של היום", key="food_scan_add_to_log"):
+                    st.session_state["food_log_items"].extend(scan_result["items"])
+                    st.session_state.pop("food_scan_result", None)
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### היומן שלי היום")
+
+        if food_log:
+            for idx, item in enumerate(food_log):
+                log_col1, log_col2 = st.columns([4, 1])
+                with log_col1:
+                    st.markdown(
+                        f"**{item['name_he']}** ({item['portion_est']}) — "
+                        f"{item['calories']} קק״ל, {item['protein_g']} גרם חלבון"
+                    )
+                with log_col2:
+                    if st.button("מחק", key=f"food_log_delete_{idx}"):
+                        st.session_state["food_log_items"].pop(idx)
+                        st.rerun()
+
+            if st.button("אפס יומן", key="food_log_reset_btn"):
+                st.session_state["food_log_items"] = []
+                st.rerun()
+        else:
+            st.markdown(
+                '<div class="gemifit-placeholder">🍽️ עדיין לא הוספתם פריטים ליומן היום.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.caption(
+            "הערכים הם הערכה בלבד לפי התמונה - גדלי מנות קשים לזיהוי מדויק."
+        )
+        st.caption("היומן נשמר לביקור הנוכחי בלבד.")
