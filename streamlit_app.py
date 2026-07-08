@@ -199,28 +199,43 @@ def is_gsheets_configured():
 CLOUD_WEIGHT_WORKSHEET = "weights"
 CLOUD_WEIGHT_COLUMNS = ["email", "date", "weight_kg"]
 
+CLOUD_WATER_WORKSHEET = "water"
+CLOUD_WATER_COLUMNS = ["email", "date", "ml_total", "goal_ml"]
+
+DEFAULT_WATER_GOAL_ML = 2500
+
 
 @st.cache_resource(show_spinner=False)
-def get_cloud_weight_worksheet():
+def _get_gsheets_spreadsheet():
     gsheets_secrets = dict(st.secrets["connections"]["gsheets"])
     spreadsheet_ref = gsheets_secrets.pop("spreadsheet")
 
     client = gspread.service_account_from_dict(gsheets_secrets)
-    spreadsheet = (
+    return (
         client.open_by_url(spreadsheet_ref)
         if spreadsheet_ref.startswith("http")
         else client.open_by_key(spreadsheet_ref)
     )
 
-    try:
-        worksheet = spreadsheet.worksheet(CLOUD_WEIGHT_WORKSHEET)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=CLOUD_WEIGHT_WORKSHEET, rows=1000, cols=len(CLOUD_WEIGHT_COLUMNS)
-        )
-        worksheet.update(range_name="A1", values=[CLOUD_WEIGHT_COLUMNS])
 
+def _get_or_create_worksheet(title, columns):
+    spreadsheet = _get_gsheets_spreadsheet()
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(columns))
+        worksheet.update(range_name="A1", values=[columns])
     return worksheet
+
+
+@st.cache_resource(show_spinner=False)
+def get_cloud_weight_worksheet():
+    return _get_or_create_worksheet(CLOUD_WEIGHT_WORKSHEET, CLOUD_WEIGHT_COLUMNS)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cloud_water_worksheet():
+    return _get_or_create_worksheet(CLOUD_WATER_WORKSHEET, CLOUD_WATER_COLUMNS)
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -276,6 +291,128 @@ def delete_all_cloud_weight_entries(email):
     all_rows = load_all_cloud_weight_rows(fresh=True)
     remaining = all_rows[all_rows["email"] != email]
     save_all_cloud_weight_rows(remaining)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _read_all_cloud_water_rows():
+    worksheet = get_cloud_water_worksheet()
+    records = worksheet.get_all_records(expected_headers=CLOUD_WATER_COLUMNS)
+    df = pd.DataFrame(records, columns=CLOUD_WATER_COLUMNS)
+
+    df["email"] = df["email"].astype(str).str.strip()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["ml_total"] = pd.to_numeric(df["ml_total"], errors="coerce")
+    df["goal_ml"] = pd.to_numeric(df["goal_ml"], errors="coerce")
+    df = df.dropna(subset=["email", "date", "ml_total", "goal_ml"])
+    return df[df["email"] != ""].reset_index(drop=True)
+
+
+def load_all_cloud_water_rows(fresh=False):
+    if fresh:
+        st.cache_data.clear()
+    return _read_all_cloud_water_rows()
+
+
+def save_all_cloud_water_rows(df):
+    worksheet = get_cloud_water_worksheet()
+    sorted_df = df.sort_values(["email", "date"]).reset_index(drop=True)
+    values = [CLOUD_WATER_COLUMNS] + [
+        [row.email, row.date.isoformat(), row.ml_total, row.goal_ml]
+        for row in sorted_df.itertuples(index=False)
+    ]
+    worksheet.clear()
+    worksheet.update(range_name="A1", values=values)
+    st.cache_data.clear()
+
+
+def get_user_cloud_water_today(email):
+    today = date.today()
+    all_rows = load_all_cloud_water_rows()
+    match = all_rows[(all_rows["email"] == email) & (all_rows["date"] == today)]
+    if match.empty:
+        return 0, DEFAULT_WATER_GOAL_ML
+    row = match.iloc[0]
+    return int(row["ml_total"]), int(row["goal_ml"])
+
+
+def save_cloud_water_today(email, ml_total, goal_ml):
+    today = date.today()
+    all_rows = load_all_cloud_water_rows(fresh=True)
+    other_rows = all_rows[~((all_rows["email"] == email) & (all_rows["date"] == today))]
+    new_row = pd.DataFrame(
+        [{"email": email, "date": today, "ml_total": ml_total, "goal_ml": goal_ml}]
+    )
+    save_all_cloud_water_rows(pd.concat([other_rows, new_row], ignore_index=True))
+
+
+def ensure_guest_water_state():
+    today = date.today()
+    if st.session_state.get("water_date") != today:
+        st.session_state["water_date"] = today
+        st.session_state["water_ml_total"] = 0
+    st.session_state.setdefault("water_goal_ml", DEFAULT_WATER_GOAL_ML)
+
+
+def render_water_tracker(ml_total, goal_ml, on_add, on_set_goal, on_reset):
+    st.markdown("##### 💧 מעקב מים יומי")
+
+    goal_col, _ = st.columns([2, 2])
+    with goal_col:
+        new_goal = st.number_input(
+            "יעד יומי (מ״ל)",
+            min_value=1000,
+            max_value=5000,
+            value=int(goal_ml),
+            step=250,
+            key="water_goal_input",
+        )
+    if new_goal != goal_ml:
+        on_set_goal(new_goal)
+        goal_ml = new_goal
+
+    progress_ratio = min(ml_total / goal_ml, 1.0) if goal_ml else 0.0
+    st.progress(progress_ratio)
+    st.markdown(
+        f"<div style='text-align:center; font-weight:700; font-size:1.1rem; margin:0.4rem 0;'>"
+        f"<span class='gemifit-ltr'>{ml_total}</span> מתוך "
+        f"<span class='gemifit-ltr'>{goal_ml}</span> מ״ל</div>",
+        unsafe_allow_html=True,
+    )
+
+    if ml_total >= goal_ml:
+        encouragement = "🎉 כל הכבוד! הגעתם ליעד המים היומי שלכם!"
+    elif ml_total >= goal_ml * 0.5:
+        encouragement = "💪 כבר באמצע הדרך — כל הכבוד, המשיכו כך!"
+    else:
+        encouragement = "🚰 בואו נתחיל לשתות, כל כוס עוזרת!"
+    st.markdown(f'<div class="gemifit-note">{encouragement}</div>', unsafe_allow_html=True)
+
+    qa_col1, qa_col2, qa_col3 = st.columns(3)
+    with qa_col1:
+        if st.button("+ כוס (250)", key="water_add_cup", use_container_width=True):
+            on_add(250)
+    with qa_col2:
+        if st.button("+ בקבוק (500)", key="water_add_bottle", use_container_width=True):
+            on_add(500)
+    with qa_col3:
+        if st.button("אפס להיום", key="water_reset_btn", use_container_width=True):
+            on_reset()
+
+    custom_col1, custom_col2 = st.columns([3, 1])
+    with custom_col1:
+        custom_ml = st.number_input(
+            "כמות מותאמת אישית (מ״ל)",
+            min_value=0,
+            max_value=3000,
+            value=0,
+            step=50,
+            key="water_custom_ml",
+        )
+    with custom_col2:
+        st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+        if st.button("הוסף", key="water_add_custom_btn", use_container_width=True):
+            if custom_ml > 0:
+                on_add(custom_ml)
 
 
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -347,12 +484,37 @@ NUTRITION_SYSTEM_PROMPT = """\
 בנה/י תפריט ליום שלם אחד, מחולק למספר הארוחות שהתבקש.
 לכל ארוחה: כותרת מודגשת, פירוט מזונות עם כמויות מעשיות (גרם, יחידות, כוסות) \
 וכמות קלוריות משוערת לארוחה.
-מספר הקלוריות של כל פריט חייב להתאים לכמות שצוינה לפי ערכים תזונתיים \
-מקובלים (לדוגמה: לחם ופיתה הם כ-250-280 קק״ל ל-100 גרם, ופיתה קטנה שוקלת \
-כ-60 גרם). ודא/י שמשקלי הפריטים הגיוניים ומציאותיים.
+
+טבלת ייחוס תזונתית (קק״ל ל-100 גרם אלא אם צוין אחרת) — עגן/י כל הערכה לפי \
+הטבלה הזו:
+לחם ופיתה: 250-280 (פיתה קטנה אחת ≈ 60 גרם)
+אורז מבושל: 115-130
+פסטה יבשה: 350
+עדשים מבושלות: 115
+חומוס מוכן: 170-200
+טחינה גולמית: 590-620
+שמן זית: כף אחת = 120 קק״ל
+ביצה אחת = 70-80 קק״ל
+חזה עוף: 110-120
+גבינה לבנה 5%: 95
+קוטג' 5%: 100
+יוגורט 3%: 60
+בננה בינונית = 90-105 ליחידה
+תפוח = 80-95 ליחידה
+אבוקדו: 160
+טופו: 76-120
+שיבולת שועל: 370-390
+משקה סויה ללא סוכר = 33-40 ל-100 מ״ל
+
+חובה: מספר הקלוריות של כל פריט חייב להתאים בדיוק לכמות שצוינה עבורו לפי \
+הטבלה הזו (ולערכים תזונתיים מקובלים לפריטים שאינם בטבלה). לפני כתיבת \
+התשובה הסופית, חשב/י בפועל את סכום הקלוריות של הפריטים בכל ארוחה ואמת/י \
+שהוא תואם למספר שמוצג לצד הארוחה, ולאחר מכן חשב/י את סך הקלוריות היומי \
+כסכום כל הארוחות ואמת/י שהוא בטווח של עד 5% מהיעד שצוין — אם יש פער, תקן/י \
+את הכמויות לפני שאת/ה עונה/ת. ודא/י שמשקלי הפריטים הגיוניים ומציאותיים.
+
 כתוב/כתבי מספרים בצורה פשוטה (למשל 1780) בלי פסיק מפריד אלפים, השתמש/י \
 בסימן ≈ לכל היותר פעם אחת בכל שורה, והימנע/י ממילים כפולות בכותרות הארוחות.
-סך הקלוריות היומי צריך להיות בטווח של כ-5% מהיעד שצוין.
 יש לכבד את סגנון התזונה שנבחר, את כללי הכשרות אם צוינו, ואת רשימת המאכלים \
 להימנעות.
 העדף/י מזונות פשוטים, זולים וזמינים בישראל.
@@ -908,6 +1070,49 @@ with tab_weight:
                     st.session_state["confirm_delete_all_weight"] = True
                     st.rerun()
 
+            st.markdown("---")
+
+            try:
+                cloud_ml_total, cloud_goal_ml = get_user_cloud_water_today(current_user_email)
+                water_load_error = None
+            except Exception:
+                cloud_ml_total, cloud_goal_ml = 0, DEFAULT_WATER_GOAL_ML
+                water_load_error = "אירעה שגיאה בטעינת נתוני השתייה מהענן. נסו לרענן את הדף בעוד רגע."
+
+            if water_load_error:
+                st.error(water_load_error)
+
+            def _cloud_water_add(amount_ml):
+                try:
+                    ml_total, goal_ml = get_user_cloud_water_today(current_user_email)
+                    save_cloud_water_today(current_user_email, ml_total + amount_ml, goal_ml)
+                    st.rerun()
+                except Exception:
+                    st.error("אירעה שגיאה בשמירת נתוני השתייה בענן. נסו שוב.")
+
+            def _cloud_water_set_goal(new_goal_ml):
+                try:
+                    ml_total, _ = get_user_cloud_water_today(current_user_email)
+                    save_cloud_water_today(current_user_email, ml_total, new_goal_ml)
+                except Exception:
+                    st.error("אירעה שגיאה בשמירת היעד היומי. נסו שוב.")
+
+            def _cloud_water_reset():
+                try:
+                    _, goal_ml = get_user_cloud_water_today(current_user_email)
+                    save_cloud_water_today(current_user_email, 0, goal_ml)
+                    st.rerun()
+                except Exception:
+                    st.error("אירעה שגיאה באיפוס נתוני השתייה. נסו שוב.")
+
+            render_water_tracker(
+                cloud_ml_total,
+                cloud_goal_ml,
+                _cloud_water_add,
+                _cloud_water_set_goal,
+                _cloud_water_reset,
+            )
+
     else:
         weight_df = get_weight_entries()
 
@@ -981,6 +1186,29 @@ with tab_weight:
             </div>
             """,
             unsafe_allow_html=True,
+        )
+
+        st.markdown("---")
+
+        ensure_guest_water_state()
+
+        def _guest_water_add(amount_ml):
+            st.session_state["water_ml_total"] += amount_ml
+            st.rerun()
+
+        def _guest_water_set_goal(new_goal_ml):
+            st.session_state["water_goal_ml"] = new_goal_ml
+
+        def _guest_water_reset():
+            st.session_state["water_ml_total"] = 0
+            st.rerun()
+
+        render_water_tracker(
+            st.session_state["water_ml_total"],
+            st.session_state["water_goal_ml"],
+            _guest_water_add,
+            _guest_water_set_goal,
+            _guest_water_reset,
         )
 
 with tab_workout:
